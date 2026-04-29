@@ -2,7 +2,7 @@
   "info": {
     "_postman_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
     "name": "Jobs API",
-    "description": "CRD API for jobs (create, read, delete — no update). With Docker Compose, call the API via nginx (`NGINX_HOST_PORT`, default 8080): `http://localhost:8080`.\n\nSet `job_id` after creating a job (copy `id` from the Create response).",
+    "description": "CRD API for jobs (create, read, delete — no update). With Docker Compose, call the API via nginx (`NGINX_HOST_PORT`, default 8080): `http://localhost:8080`.\n\n**Order matters.** Requests are arranged so a Collection Runner walk hits Service info → liveness → readiness → list → create → get → delete. `Get job by ID` and `Delete job` depend on the collection variable `job_id` — paste it after running `Create job`.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -26,7 +26,35 @@
           "host": ["{{baseUrl}}"],
           "path": []
         },
-        "description": "Minimal JSON banner at `/`."
+        "description": "Minimal JSON banner at `/`. Returns `{\"service\":\"jobs-api\"}`."
+      },
+      "response": []
+    },
+    {
+      "name": "Liveness (/healthz)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/healthz",
+          "host": ["{{baseUrl}}"],
+          "path": ["healthz"]
+        },
+        "description": "Liveness probe. Returns 200 with `{\"status\":\"ok\"}` whenever the HTTP server is up — does NOT check downstream dependencies. Used by the Docker / ECS container healthcheck."
+      },
+      "response": []
+    },
+    {
+      "name": "Readiness (/readyz)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/readyz",
+          "host": ["{{baseUrl}}"],
+          "path": ["readyz"]
+        },
+        "description": "Readiness probe. Pings the database with a 2s timeout. 200 `{\"status\":\"ready\"}` when the DB is reachable; 503 `{\"status\":\"unavailable\",\"reason\":\"database\"}` when it isn't. Use this for human/manual probing or for richer orchestrators — the ALB target group should still hit `/healthz`."
       },
       "response": []
     },
@@ -40,26 +68,29 @@
           "host": ["{{baseUrl}}"],
           "path": ["api", "jobs"]
         },
-        "description": "Returns all jobs, newest first."
-      },
-      "response": []
-    },
-    {
-      "name": "Get job by ID",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": {
-          "raw": "{{baseUrl}}/api/jobs/{{job_id}}",
-          "host": ["{{baseUrl}}"],
-          "path": ["api", "jobs", "{{job_id}}"]
-        },
-        "description": "Requires collection variable `job_id` (UUID string)."
+        "description": "Returns all jobs, newest first. Empty array on a fresh DB."
       },
       "response": []
     },
     {
       "name": "Create job",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status is 201', () => pm.response.to.have.status(201));",
+              "",
+              "const body = pm.response.json();",
+              "pm.test('response has id', () => pm.expect(body.id).to.be.a('string').and.not.empty);",
+              "",
+              "pm.collectionVariables.set('job_id', body.id);",
+              "console.log('job_id set to', body.id);"
+            ]
+          }
+        }
+      ],
       "request": {
         "method": "POST",
         "header": [
@@ -77,12 +108,75 @@
           "host": ["{{baseUrl}}"],
           "path": ["api", "jobs"]
         },
-        "description": "`title` is required. Optional: `company`, `description`, `status` (defaults to `open`). Response includes `id` — paste into `job_id` for Get/Delete."
+        "description": "`title` is required. Optional: `company`, `description`, `status` (defaults to `open`). On 201 the test script auto-stores the returned `id` in the `job_id` collection variable, so Get / Delete pick it up automatically on the next run."
+      },
+      "response": []
+    },
+    {
+      "name": "Get job by ID",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "if (!pm.collectionVariables.get('job_id')) {",
+              "  throw new Error('job_id is empty — run \"Create job\" first.');",
+              "}"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status is 200', () => pm.response.to.have.status(200));",
+              "pm.test('id matches job_id', () => {",
+              "  pm.expect(pm.response.json().id).to.eql(pm.collectionVariables.get('job_id'));",
+              "});"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/jobs/{{job_id}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "jobs", "{{job_id}}"]
+        },
+        "description": "Requires `job_id` (set automatically by Create job)."
       },
       "response": []
     },
     {
       "name": "Delete job",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "if (!pm.collectionVariables.get('job_id')) {",
+              "  throw new Error('job_id is empty — run \"Create job\" first.');",
+              "}"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status is 204', () => pm.response.to.have.status(204));",
+              "",
+              "pm.collectionVariables.set('job_id', '');"
+            ]
+          }
+        }
+      ],
       "request": {
         "method": "DELETE",
         "header": [],
@@ -91,7 +185,7 @@
           "host": ["{{baseUrl}}"],
           "path": ["api", "jobs", "{{job_id}}"]
         },
-        "description": "204 No Content on success."
+        "description": "204 No Content on success. Test script clears `job_id` afterwards so a stale ID can't accidentally be reused on the next run."
       },
       "response": []
     }

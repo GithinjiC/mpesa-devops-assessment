@@ -9,23 +9,25 @@ import (
 )
 
 func New(level slog.Level, logFilePath string) (*slog.Logger, func(), error) {
-	if logFilePath == "" {
-		return nil, nil, fmt.Errorf("log file path is empty")
+	var writer io.Writer = os.Stdout
+	cleanup := func() {}
+
+	if logFilePath != "" {
+		dir := filepath.Dir(logFilePath)
+		if err := os.MkdirAll(dir, 0750); err != nil {
+			return nil, nil, fmt.Errorf("create log directory: %w", err)
+		}
+		f, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			return nil, nil, fmt.Errorf("open log file: %w", err)
+		}
+		writer = io.MultiWriter(os.Stdout, f)
+		cleanup = func() {
+			_ = f.Sync()
+			_ = f.Close()
+		}
 	}
-	dir := filepath.Dir(logFilePath)
-	if err := os.MkdirAll(dir, 0750); err != nil {
-		return nil, nil, fmt.Errorf("create log directory: %w", err)
-	}
-	f, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return nil, nil, fmt.Errorf("open log file: %w", err)
-	}
-	mw := io.MultiWriter(os.Stdout, f)
-	h := slog.NewJSONHandler(mw, &slog.HandlerOptions{Level: level})
-	logger := slog.New(h)
-	cleanup := func() {
-		_ = f.Sync()
-		_ = f.Close()
-	}
-	return logger, cleanup, nil
+
+	h := slog.NewJSONHandler(writer, &slog.HandlerOptions{Level: level})
+	return slog.New(h), cleanup, nil
 }

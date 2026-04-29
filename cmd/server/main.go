@@ -55,9 +55,10 @@ func run() int {
 	}
 
 	jh := &handlers.Jobs{DB: pool, Log: logger}
+	hh := &handlers.Health{DB: pool, Log: logger}
 
 	addr := cfg.ListenAddress()
-	handler := newRouter(cfg, logger, jh)
+	handler := newRouter(cfg, logger, jh, hh)
 
 	srv := &http.Server{
 		Addr:              addr,

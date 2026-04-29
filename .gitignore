@@ -1,2 +1,13 @@
 .env
 logs/
+NOTES.md
+
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+**/terraform.tfvars
+**/*.auto.tfvars
+crash.log
+crash.*.log

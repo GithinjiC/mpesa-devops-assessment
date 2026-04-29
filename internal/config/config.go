@@ -90,10 +90,7 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
-	logFilePath, err := requiredEnv("LOG_FILE_PATH")
-	if err != nil {
-		return nil, err
-	}
+	logFilePath := strings.TrimSpace(os.Getenv("LOG_FILE_PATH"))
 
 	serviceName, err := requiredEnv("SERVICE_NAME")
 	if err != nil {

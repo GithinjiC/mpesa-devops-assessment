@@ -12,7 +12,7 @@ import (
 	"log/slog"
 )
 
-func newRouter(cfg *config.Config, logger *slog.Logger, jh *handlers.Jobs) http.Handler {
+func newRouter(cfg *config.Config, logger *slog.Logger, jh *handlers.Jobs, hh *handlers.Health) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(cfg.HTTPRequestTimeout))
@@ -25,6 +25,9 @@ func newRouter(cfg *config.Config, logger *slog.Logger, jh *handlers.Jobs) http.
 			logger.Error("write service info response", slog.Any("err", err))
 		}
 	})
+
+	r.Get("/healthz", hh.Live)
+	r.Get("/readyz", hh.Ready)
 
 	r.Route("/api/jobs", func(api chi.Router) {
 		api.Get("/", jh.List)

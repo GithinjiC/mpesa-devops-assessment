@@ -1,0 +1,141 @@
+name: Rollback
+
+# Manual-trigger only.
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag (commit SHA) to roll back to. Leave blank to redeploy the previous task-definition revision.'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: test-ecs
+  ECS_CLUSTER: test-ecs-cluster
+  ECS_SERVICE: test-ecs-svc
+  ECS_TASK_FAMILY: test-ecs-app
+  CONTAINER_NAME: app
+
+jobs:
+  rollback:
+    name: Rollback ECS service
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: http://${{ vars.ALB_DNS_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve target image
+        id: resolve
+        run: |
+          set -euo pipefail
+
+          REGISTRY=$(aws ecr describe-repositories \
+            --repository-names "${ECR_REPOSITORY}" \
+            --query 'repositories[0].repositoryUri' \
+            --output text)
+
+          INPUT_TAG="${{ inputs.image_tag }}"
+
+          if [ -n "$INPUT_TAG" ]; then
+            echo "Mode: explicit tag → $INPUT_TAG"
+            # Verify the image actually exists in ECR before we try to deploy it.
+            aws ecr describe-images \
+              --repository-name "${ECR_REPOSITORY}" \
+              --image-ids "imageTag=$INPUT_TAG" \
+              >/dev/null
+            IMAGE="${REGISTRY}:${INPUT_TAG}"
+          else
+            echo "Mode: previous task-definition revision"
+            CURRENT_TD=$(aws ecs describe-services \
+              --cluster "${ECS_CLUSTER}" \
+              --services "${ECS_SERVICE}" \
+              --query 'services[0].taskDefinition' \
+              --output text)
+            CURRENT_REV="${CURRENT_TD##*:}"
+            FAMILY_PATH="${CURRENT_TD%:*}"
+            FAMILY="${FAMILY_PATH##*/}"
+            PREV_REV=$((CURRENT_REV - 1))
+
+            if [ "$PREV_REV" -lt 1 ]; then
+              echo "::error::No previous task-definition revision exists (current rev = $CURRENT_REV). Pass image_tag explicitly."
+              exit 1
+            fi
+
+            IMAGE=$(aws ecs describe-task-definition \
+              --task-definition "${FAMILY}:${PREV_REV}" \
+              --query "taskDefinition.containerDefinitions[?name=='${CONTAINER_NAME}'].image | [0]" \
+              --output text)
+
+            if [ -z "$IMAGE" ] || [ "$IMAGE" = "None" ]; then
+              echo "::error::Could not resolve image for ${FAMILY}:${PREV_REV}"
+              exit 1
+            fi
+          fi
+
+          # Refuse to roll back to the placeholder bootstrap image — that's
+          # almost certainly an accident.
+          case "$IMAGE" in
+            public.ecr.aws/nginx/*)
+              echo "::error::Refusing to roll back to placeholder image $IMAGE"
+              exit 1
+              ;;
+          esac
+
+          echo "Resolved rollback image: $IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${ECS_TASK_FAMILY}" \
+            --query taskDefinition \
+            --output json \
+          | jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
+          > task-def.json
+
+      - name: Render task definition with rollback image
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-def.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.resolve.outputs.image }}
+
+      - name: Deploy rollback to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 12); do
+            if curl -fsS "http://${{ vars.ALB_DNS_NAME }}/healthz" >/dev/null; then
+              echo "/healthz green after rollback to ${{ steps.resolve.outputs.image }}"
+              exit 0
+            fi
+            echo "attempt $i: /healthz not green yet, sleeping 5s..."
+            sleep 5
+          done
+          echo "::error::/healthz never returned 200 after rollback. The target image may also be broken — try an older known-good tag."
+          exit 1

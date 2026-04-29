@@ -1,6 +1,7 @@
 services:
   db:
     image: postgres:16-alpine
+    restart: unless-stopped
     env_file:
       - .env
     environment:
@@ -23,6 +24,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    restart: unless-stopped
     env_file:
       - .env
     environment:
@@ -32,9 +34,20 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- http://127.0.0.1:${PORT}/healthz >/dev/null 2>&1 || exit 1",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
 
   nginx:
     image: nginx:1.27-alpine
+    restart: unless-stopped
     ports:
       - "${NGINX_HOST_PORT:?set NGINX_HOST_PORT in .env}:${NGINX_CONTAINER_HTTP_PORT:?set NGINX_CONTAINER_HTTP_PORT in .env}"
     env_file:
@@ -45,7 +58,8 @@ services:
     volumes:
       - ./nginx/templates:/etc/nginx/templates:ro
     depends_on:
-      - app
+      app:
+        condition: service_healthy
 
 volumes:
   pgdata:

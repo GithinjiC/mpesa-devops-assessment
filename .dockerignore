@@ -1,8 +1,16 @@
 .git
+.gitignore
+.github
 *.md
 .env
+.env-sample
 logs/
 nginx/
 postman/
+Dockerfile
+docker-compose.yml
+.dockerignore
+NOTES.md
 /job-api
 /job-crud
+/migrate
