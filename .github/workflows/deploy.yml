@@ -1,18 +1,49 @@
+# Deploy — runs on every push to `main` (or by manual dispatch).
+#
+# Pipeline:
+#   1. lint-and-test  — repeats CI's checks against the merged tip
+#   2. build-and-push — builds the Docker image, tags with commit SHA,
+#                       pushes to ECR
+#   3. deploy         — paused at the `production` environment gate;
+#                       once approved, registers a new task-definition
+#                       revision and rolls the ECS service. Smoke-tests
+#                       /healthz from the runner before declaring success.
+
 name: Deploy
 
+# Triggers
+# `push: main` for the normal flow (every merged PR triggers a deploy run).
+# `workflow_dispatch` lets us re-run a deploy manually from the Actions UI
+# without having to push another commit — useful for retrying a transient
+# infrastructure failure or re-deploying after a manual ECS change.
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
+# Permissions
+# `id-token: write` is the critical bit: it lets the workflow request a
+# short-lived OIDC JWT from GitHub, which `aws-actions/configure-aws-credentials`
+# trades for STS credentials via our IAM trust policy. Without this, OIDC auth
+# silently fails. `contents: read` is enough for `actions/checkout`.
 permissions:
   contents: read
-  id-token: write # for OIDC -> AWS
+  id-token: write
 
+# Concurrency
+# Only one deploy may run against `main` at a time — `cancel-in-progress: false`
+# means new deploys queue rather than killing the in-flight one. Killing a
+# half-applied ECS rollout would be worse than waiting. The same group is
+# used by rollback.yml so a rollback can never race a forward deploy.
 concurrency:
   group: deploy-main
   cancel-in-progress: false
 
+# Workflow-level env vars — the names ECS resources got from Terraform. If
+# you ever rename in Terraform (e.g. by changing `var.project`), these need
+# to update in lockstep. They are NOT pulled from `terraform output` because
+# that would couple the workflow to a Terraform state read. 
+# Among the future improvements is to move these to env variables.
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: test-ecs
@@ -22,6 +53,10 @@ env:
   CONTAINER_NAME: app
 
 jobs:
+  # Job 1: lint-and-test
+  # Same as ci.yml's lint-and-test job. Repeated here as defense in depth — if
+  # branch protection were ever misconfigured (or someone pushed directly to
+  # main), this catches a broken main *before* we publish a broken image to ECR.
   lint-and-test:
     name: Lint and test
     runs-on: ubuntu-latest
@@ -49,27 +84,52 @@ jobs:
       - name: go test
         run: go test -race -count=1 ./...
 
+  # Job 2: build-and-push
+  # Builds the Docker image, tags it with the full commit SHA, and pushes to
+  # ECR. The image URI is exposed as a job output so the deploy job can pin
+  # exactly what was just built (no race with "latest").
   build-and-push:
     name: Build and push image
     runs-on: ubuntu-latest
     needs: lint-and-test
+    # Expose the URI of the image we just pushed. The deploy job consumes
+    # this via `${{ needs.build-and-push.outputs.image }}` — that's how we
+    # guarantee deploy uses *exactly* the image this job produced, not
+    # something else that may have raced into ECR in the meantime.
     outputs:
       image: ${{ steps.image.outputs.uri }}
     steps:
       - uses: actions/checkout@v4
 
+      # OIDC handshake. The trust policy on `aws_iam_role.github_actions`
+      # gates on `sub: repo:GithinjiC/...:ref:refs/heads/main` for jobs
+      # without an `environment:` production. The role has ECR push perms
+      # scoped to the single ECR repo ARN — no wildcard repo access.
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # Logs `docker` into ECR using the credentials assumed above.
+      # Outputs `registry` (the ECR account-region prefix) for tagging.
       - name: Log in to Amazon ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      # Required for BuildKit features used below (`cache-from: type=gha`,
+      # multi-stage builds with `--mount=type=cache`, etc.).
       - uses: docker/setup-buildx-action@v3
 
+      # Tag = `${{ github.sha }}` (full 40-char SHA). Why:
+      #   * ECR is configured with `image_tag_mutability = IMMUTABLE` in
+      #     Terraform — same tag can never be silently overwritten.
+      #   * The SHA is unambiguous and links every deployed image directly
+      #     back to the commit that produced it.
+      #   * The deploy job below consumes exactly this tag — no race window.
+      # `provenance: false` disables the SLSA provenance attestation that
+      # buildx adds by default; ECR doesn't support it, so leaving it on
+      # produces a noisy warning on every push without any benefit.
       - name: Build and push (tag = commit SHA)
         uses: docker/build-push-action@v6
         with:
@@ -80,27 +140,56 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: false
 
+      # Export the image URI as a job output so the deploy job can read it.
+      # This couples deploy i.e. the exact image we just pushed, instead of having
+      # deploy reconstruct the URI from `github.sha` (which would also work,
+      # but ties the two jobs to the same SHA convention rather than data). This is to avoid any race conditions.
       - name: Export image URI
         id: image
         run: |
           echo "uri=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
 
+  # Job 3: deploy
+  # Rolls the new image into the ECS service. Gated by the `production`
+  # GitHub environment. Required reviewers must approve before this job
+  # runs. Smoke-tests /healthz once ECS reports the service stable, so a
+  # green workflow run actually means the app is serving.
   deploy:
     name: Deploy to ECS (production)
     runs-on: ubuntu-latest
     needs: build-and-push
+    # The `production` environment is the manual approval gate. Configured
+    # in repo Settings(Environments with required reviewers). Until a
+    # reviewer approves, this job sits in "Waiting" status. The `url:`
+    # surfaces the ALB hostname as a clickable "View deployment" link in
+    # the Actions UI after the run.
+    #
+    # Side effect: when an `environment:` is set, GitHub rewrites the OIDC
+    # `sub` claim from `ref:refs/heads/main` to `environment:production`.
+    # Our IAM trust policy allows BOTH forms. Ref iam.tf.
     environment:
       name: production
       url: http://${{ vars.ALB_DNS_NAME }}
     steps:
       - uses: actions/checkout@v4
 
+      # Same OIDC handshake, but this time the token's sub claim is
+      # `environment:production`, which the trust policy explicitly allows.
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # Pull the currently registered task definition. We need the whole
+      # thing because we'll register a new revision with only the image
+      # field changed, preserving env vars, secrets bindings, IAM roles,
+      # log config, etc. that Terraform set on the original.
+      #
+      # `jq 'del(...)'` strips fields that AWS injects on read but rejects
+      # on write (`taskDefinitionArn`, `revision`, `status`, etc.). Without
+      # this, the next `RegisterTaskDefinition` call returns a validation
+      # error.
       - name: Download current task definition
         run: |
           aws ecs describe-task-definition \
@@ -110,6 +199,9 @@ jobs:
           | jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
           > task-def.json
 
+      # Swap only the `image:` field of the named container in task-def.json.
+      # The action emits a path to a new JSON file (not the JSON itself) via
+      # the `task-definition` output, which the next step consumes.
       - name: Render new task definition with the new image
         id: render
         uses: aws-actions/amazon-ecs-render-task-definition@v1
@@ -118,6 +210,12 @@ jobs:
           container-name: ${{ env.CONTAINER_NAME }}
           image: ${{ needs.build-and-push.outputs.image }}
 
+      # Two operations under the hood:
+      #   1. RegisterTaskDefinition — creates a new revision in the family.
+      #   2. UpdateService — points the service at the new revision and
+      #      starts the rolling deployment.
+      # `wait-for-service-stability: true` blocks until ECS reports the
+      # service back at steady state. Times out at 10m by default.
       - name: Deploy to ECS service
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
@@ -126,6 +224,12 @@ jobs:
           cluster: ${{ env.ECS_CLUSTER }}
           wait-for-service-stability: true
 
+      # Belt-and-braces check: ECS reporting "service stable" means the new
+      # tasks reached steady state from the orchestrator's POV, but the app
+      # could still be returning errors (5xx). A real /healthz hit from
+      # outside AWS proves the path Internet → ALB → task → container is
+      # alive, end-to-end. 12 × 5s = 60s window, which covers the
+      # target-group health-check delay after a fresh task registration.
       - name: Smoke test
         run: |
           set -euo pipefail

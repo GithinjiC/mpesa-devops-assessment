@@ -122,7 +122,10 @@ data "aws_iam_policy_document" "github_assume" {
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_org}/${var.github_repo}:ref:refs/heads/${var.github_branch}"]
+      values = [
+        "repo:${var.github_org}/${var.github_repo}:ref:refs/heads/${var.github_branch}",
+        "repo:${var.github_org}/${var.github_repo}:environment:${var.github_deploy_environment}",
+      ]
     }
   }
 }
@@ -165,7 +168,6 @@ data "aws_iam_policy_document" "github_actions" {
       "ecs:DescribeServices",
       "ecs:DescribeTasks",
       "ecs:ListTasks",
-      "ecs:DescribeTaskDefinition",
     ]
     resources = [
       aws_ecs_service.app.id,
@@ -175,9 +177,12 @@ data "aws_iam_policy_document" "github_actions" {
   }
 
   statement {
-    sid       = "EcsRegisterTaskDef"
-    effect    = "Allow"
-    actions   = ["ecs:RegisterTaskDefinition"]
+    sid    = "EcsTaskDefMetadataNoResourceLevel"
+    effect = "Allow"
+    actions = [
+      "ecs:RegisterTaskDefinition",
+      "ecs:DescribeTaskDefinition",
+    ]
     resources = ["*"]
   }
 

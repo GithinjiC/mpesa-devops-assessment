@@ -101,7 +101,7 @@ variable "placeholder_image" {
 }
 
 variable "image_tag" {
-  description = "Tag of the application image to deploy. CI overrides this via -var or by updating the task definition directly."
+  description = "Tag of the application image to deploy."
   type        = string
   default     = ""
 }
@@ -122,4 +122,10 @@ variable "github_branch" {
   description = "Branch allowed to assume the deployment role via OIDC."
   type        = string
   default     = "main"
+}
+
+variable "github_deploy_environment" {
+  description = "Name of the GitHub Actions environment used by the deploy job."
+  type        = string
+  default     = "production"
 }

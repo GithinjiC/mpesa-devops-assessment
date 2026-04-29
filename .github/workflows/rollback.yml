@@ -1,6 +1,22 @@
+# Rollback — manual recovery path when a deploy ships and the app fails.
+#
+# Two modes, both gated by the same `production` environment approval as
+# deploy.yml:
+#   * No input → redeploy the previous task-definition revision.
+#   * `image_tag` provided → deploy a specific commit SHA from ECR. Used when
+#     the bad version is several revisions back, so going back one isn't
+#     enough.
+#
+# Skips lint+test+build entirely — the image we're rolling back to was already
+# built and pushed by a previous Deploy run, so there's nothing to compile.
+
 name: Rollback
 
-# Manual-trigger only.
+# Triggers
+# `workflow_dispatch` only — there is no automatic rollback. Rollbacks should
+# be a deliberate human decision (and the production environment requires
+# reviewer approval before this job runs anyway). The optional `image_tag`
+# input switches between the two modes described above.
 on:
   workflow_dispatch:
     inputs:
@@ -9,14 +25,24 @@ on:
         required: false
         default: ''
 
+# Permissions
+# Same as deploy.yml — `id-token: write` is needed for the OIDC handshake
+# to AWS. Everything else stays read-only.
 permissions:
   contents: read
   id-token: write
 
+# Concurrency
+# Shares the `deploy-main` lane with deploy.yml. Effect: a rollback can never
+# run in parallel with (or race against) a forward deploy. Whichever one
+# starts first finishes first; the other queues. Critical because both touch
+# the same ECS service.
 concurrency:
   group: deploy-main
   cancel-in-progress: false
 
+# Same workflow-level env vars as deploy.yml. They have to match because
+# both workflows operate on the same AWS resources. Move these to env vars in future.
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: test-ecs
@@ -26,9 +52,18 @@ env:
   CONTAINER_NAME: app
 
 jobs:
+  # Single job: rollback
+  # No build step — the image we're targeting is already in ECR. Steps:
+  #   1. Resolve which image URI to deploy
+  #   2. Render a new task-definition revision pointing at that image
+  #   3. Roll the ECS service
+  #   4. Smoke-test /healthz from outside
   rollback:
     name: Rollback ECS service
     runs-on: ubuntu-latest
+    # Same `production` environment as deploy.yml. The required-reviewer rule
+    # applies. A rollback can be just as disruptive as a forward deploy
+    # Same gate, same reviewers.
     environment:
       name: production
       url: http://${{ vars.ALB_DNS_NAME }}
@@ -41,6 +76,26 @@ jobs:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # Resolve which image URI we're going to roll the service to. Two
+      # possible paths inside this step:
+      #
+      # Mode 1 — explicit tag was passed:
+      #   We trust the operator's choice but verify the image actually
+      #   exists in ECR (`aws ecr describe-images`). If it doesn't, fail
+      #   here rather than discovering it during ECS deploy 30s later.
+      #
+      # Mode 2 — no tag passed:
+      #   Look up the service's currently registered task definition,
+      #   subtract 1 from the revision number, and read the image URI
+      #   from that prior revision. This handles the typical "the deploy
+      #   I just approved was bad, undo it" case without making the
+      #   operator hunt for SHAs.
+      #
+      # In both modes, refuse to roll back to the bootstrap placeholder
+      # image (public.ecr.aws/nginx/...). That image only ever exists
+      # in the very first task-definition revision Terraform created
+      # before CI took over. Pointing the service at it post-bootstrap
+      # is almost certainly an accident.
       - name: Resolve target image
         id: resolve
         run: |
@@ -63,6 +118,9 @@ jobs:
             IMAGE="${REGISTRY}:${INPUT_TAG}"
           else
             echo "Mode: previous task-definition revision"
+            # Service's CURRENT task definition arn looks like:
+            #   arn:aws:ecs:us-east-1:123:task-definition/test-ecs-app:7
+            # We want family + revision parts so we can ask for revision (7-1).
             CURRENT_TD=$(aws ecs describe-services \
               --cluster "${ECS_CLUSTER}" \
               --services "${ECS_SERVICE}" \
@@ -78,6 +136,9 @@ jobs:
               exit 1
             fi
 
+            # Read the image URI from the previous task-def revision.
+            # JMESPath filter pulls the image of the container we care about
+            # (since a task def can technically have multiple containers).
             IMAGE=$(aws ecs describe-task-definition \
               --task-definition "${FAMILY}:${PREV_REV}" \
               --query "taskDefinition.containerDefinitions[?name=='${CONTAINER_NAME}'].image | [0]" \
@@ -101,6 +162,10 @@ jobs:
           echo "Resolved rollback image: $IMAGE"
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
 
+      # Same approach as deploy.yml: pull the current full task definition,
+      # strip the read-only fields AWS injects, and feed it into the render
+      # action. Preserves all the env vars, secrets bindings, and IAM roles
+      # Terraform set on the original.
       - name: Download current task definition
         run: |
           aws ecs describe-task-definition \
@@ -110,6 +175,8 @@ jobs:
           | jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
           > task-def.json
 
+      # Swap the image to the rollback target resolved above. Same action
+      # as deploy.yml; only the image URI differs.
       - name: Render task definition with rollback image
         id: render
         uses: aws-actions/amazon-ecs-render-task-definition@v1
@@ -118,6 +185,10 @@ jobs:
           container-name: ${{ env.CONTAINER_NAME }}
           image: ${{ steps.resolve.outputs.image }}
 
+      # Register the new revision and roll the service. This produces a
+      # new task-definition revision number — even though we're "going
+      # backwards" image-wise, ECS sees this as a new deploy. So a
+      # rollback-of-the-rollback is also possible via this same workflow.
       - name: Deploy rollback to ECS
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
@@ -126,6 +197,11 @@ jobs:
           cluster: ${{ env.ECS_CLUSTER }}
           wait-for-service-stability: true
 
+      # Verify the rollback target is actually serving. Failure here means
+      # the image we rolled back to is also broken — the rollback itself
+      # has happened (ECS doesn't undo it), but we couldn't confirm recovery.
+      # The error message hints at the next step: try a different known-good
+      # image_tag from earlier in history.
       - name: Smoke test
         run: |
           set -euo pipefail

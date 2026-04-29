@@ -1,29 +1,57 @@
+# CI — runs on every pull request targeting `main`.
+#
+# This workflow is the "gate" before merge. It does NOT push images, deploy,
+# or touch any AWS resource. That's handled by deploy.yml's. The only thing this
+# workflow proves is: the code compiles, tests pass, and the Dockerfile is
+# still buildable. If this is green, branch protection allows the PR to merge.
+
 name: CI
 
+# Triggers
+# `pull_request` only — this workflow exists purely as a merge gate. 
+# Pushes to `main` are handled by deploy.yml, which
+# re-runs the same lint/test steps before building.
 on:
   pull_request:
     branches: [main]
 
+# Permissions
+# Locked down to the minimum: `contents: read` to check out the repo. 
 permissions:
   contents: read
 
+# Concurrency
+# When a PR receives multiple pushes in quick succession, cancel the in-flight
+# CI run and start a fresh one against the latest commit. Saves runner minutes
+# and avoids reporting status from a stale commit. The group is keyed by
+# `github.ref` so different PRs don't cancel each other.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # Job 1: lint-and-test
+  # Formatting, static analysis, tests with the race detector.
+  # Fast (~1 min); runs first because if the code doesn't compile or tests
+  # fail there's no point spending another 2-3 minutes on a Docker build.
   lint-and-test:
     name: Lint and test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      # `go-version-file: go.mod` keeps the workflow in sync with whatever Go
+      # version the codebase declares.
+      # `cache: true` caches the module download + build cache between runs.
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
 
+      # `gofmt -l` lists files that need formatting; we treat any non-empty
+      # output as a failure. 
+      # The `::error::` prefix surfaces this as a red annotation in the PR.
       - name: gofmt
         run: |
           unformatted=$(gofmt -l .)
@@ -36,9 +64,18 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      # `-race` catches data races — slower but worth it on every PR.
+      # `-count=1` defeats Go's test-result caching; we always want a fresh
+      # run on the exact commit being reviewed.
       - name: go test
         run: go test -race -count=1 ./...
 
+  # Job 2: docker-build
+  # Verifies the Dockerfile still builds without pushing the image anywhere.
+  # Catches Dockerfile regressions at PR time instead of at deploy time.
+  #
+  # `needs: lint-and-test` so a code-level failure short-circuits before we
+  # spend ~2 minutes on a Docker build.
   docker-build:
     name: Verify Dockerfile builds
     runs-on: ubuntu-latest
@@ -46,8 +83,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Buildx adds BuildKit features;
+      # required for the `cache-from: type=gha` directive below.
       - uses: docker/setup-buildx-action@v3
 
+      # `push: false` — we explicitly do not push to ECR from PRs. Image push
+      # is restricted to merged commits on main (deploy.yml). Tag is throwaway.
+      # `cache-from`/`cache-to: type=gha` reuses BuildKit cache across runs
+      # via the GitHub Actions cache backend making every
+      # subsequent build with unchanged go.mod/go.sum at least ~10x faster.
       - name: Build (no push)
         uses: docker/build-push-action@v6
         with:
