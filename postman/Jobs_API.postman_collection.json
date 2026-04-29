@@ -1,0 +1,99 @@
+{
+  "info": {
+    "_postman_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "name": "Jobs API",
+    "description": "CRD API for jobs (create, read, delete — no update). With Docker Compose, call the API via nginx (`NGINX_HOST_PORT`, default 8080): `http://localhost:8080`.\n\nSet `job_id` after creating a job (copy `id` from the Create response).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "job_id",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "Service info",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/",
+          "host": ["{{baseUrl}}"],
+          "path": []
+        },
+        "description": "Minimal JSON banner at `/`."
+      },
+      "response": []
+    },
+    {
+      "name": "List jobs",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/jobs",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "jobs"]
+        },
+        "description": "Returns all jobs, newest first."
+      },
+      "response": []
+    },
+    {
+      "name": "Get job by ID",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/jobs/{{job_id}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "jobs", "{{job_id}}"]
+        },
+        "description": "Requires collection variable `job_id` (UUID string)."
+      },
+      "response": []
+    },
+    {
+      "name": "Create job",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"title\": \"Backend Engineer\",\n  \"company\": \"Example Corp\",\n  \"description\": \"Go and Postgres.\",\n  \"status\": \"open\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/jobs",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "jobs"]
+        },
+        "description": "`title` is required. Optional: `company`, `description`, `status` (defaults to `open`). Response includes `id` — paste into `job_id` for Get/Delete."
+      },
+      "response": []
+    },
+    {
+      "name": "Delete job",
+      "request": {
+        "method": "DELETE",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/jobs/{{job_id}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "jobs", "{{job_id}}"]
+        },
+        "description": "204 No Content on success."
+      },
+      "response": []
+    }
+  ]
+}
